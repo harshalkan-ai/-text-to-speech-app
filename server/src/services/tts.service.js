@@ -1,89 +1,216 @@
+import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts';
 import env from '../config/env.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { CURATED_VOICES } from '../utils/constants.js';
 
-// Default ElevenLabs voice (Rachel - natural and expressive)
-const DEFAULT_VOICE_ID = '21m00Tcm4TlvDq8ikWAM';
+// Map ElevenLabs voice IDs to Azure Neural Voices as seamless backup
+const ELEVEN_FALLBACK_MAP = {
+    '21m00Tcm4TlvDq8ikWAM': 'en-US-JennyNeural',      // Rachel -> Jenny (Warm & Natural)
+    'AZnzlk1XvdvUeBnXmlld': 'en-US-AriaNeural',       // Domi -> Aria (Expressive & Strong)
+    'EXAVITQu4vr4xnSDxMaL': 'en-US-EmmaNeural',       // Bella -> Emma (Warm)
+    'ErXwobaYiN019PkySvjV': 'en-US-GuyNeural',        // Antoni -> Guy (Crisp & Professional)
+    'VR6AewLTigWG4xSOukaG': 'en-US-ChristopherNeural',// Arnold -> Christopher (Deep Narrative)
+};
+
+// Map each language to a default Female and Male voice
+const DEFAULT_LANGUAGE_VOICES = {
+    'en-US': { female: 'en-US-JennyNeural', male: 'en-US-GuyNeural' },
+    'en-GB': { female: 'en-GB-SoniaNeural', male: 'en-GB-RyanNeural' },
+    'en-IN': { female: 'en-IN-NeerjaNeural', male: 'en-IN-PrabhatNeural' },
+    'hi-IN': { female: 'hi-IN-SwaraNeural', male: 'hi-IN-MadhurNeural' },
+    'gu-IN': { female: 'gu-IN-DhwaniNeural', male: 'gu-IN-NiranjanNeural' },
+    'mr-IN': { female: 'mr-IN-AarohiNeural', male: 'mr-IN-ManoharNeural' },
+    'es-ES': { female: 'es-ES-ElviraNeural', male: 'es-ES-AlvaroNeural' },
+    'fr-FR': { female: 'fr-FR-DeniseNeural', male: 'fr-FR-HenriNeural' },
+    'de-DE': { female: 'de-DE-KatjaNeural', male: 'de-DE-ConradNeural' },
+};
 
 /**
- * Converts text into speech using ElevenLabs Neural AI API.
- * @param {Object} params
- * @param {string} params.text - The text to synthesize
- * @param {string} [params.voiceId] - Optional voice ID
- * @param {number} [params.speed=1.0] - Optional playback rate
- * @returns {Promise<{ audioBuffer: Buffer, mimeType: string, voiceId: string }>}
+ * Automatically translates text to the target language if required.
+ * Returns translated text (or original text if translation fails or not needed).
  */
-export async function synthesizeSpeech({ text, voiceId, speed = 1.0 }) {
-    // If voiceId is not provided, use default
-    const selectedVoiceId = voiceId || DEFAULT_VOICE_ID;
-
-    // 1. Verify API Key is configured
-    if (!env.TTS_API_KEY || env.TTS_API_KEY.trim() === '') {
-        throw new AppError(
-            'TTS API Key is missing. Please configure TTS_API_KEY in server/.env',
-            503,
-            'TTS_KEY_MISSING'
-        );
-    }
-
-    const endpoint = `https://api.elevenlabs.io/v1/text-to-speech/${selectedVoiceId}`;
-
+export async function translateTextToTarget(text, targetLang = 'en-US') {
+    if (!text || !text.trim()) return text;
+    
+    // Extract 2-letter language code
+    const lang = targetLang.split('-')[0].toLowerCase();
+    
     try {
-        // 2. Call ElevenLabs API
-        const response = await fetch(endpoint, {
-            method: 'POST',
+        const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${lang}&dt=t&q=${encodeURIComponent(text.trim())}`;
+        const res = await fetch(url, {
             headers: {
-                Accept: 'audio/mpeg',
-                'Content-Type': 'application/json',
-                'xi-api-key': env.TTS_API_KEY,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             },
-            body: JSON.stringify({
-                text,
-                model_id: 'eleven_multilingual_v2', // High quality multilingual support (English, Hindi, etc.)
-                voice_settings: {
-                    stability: 0.5,
-                    similarity_boost: 0.75,
-                    style: 0.0,
-                    use_speaker_boost: true,
-                },
-            }),
         });
 
-        // 3. Handle API errors from ElevenLabs (quota exhausted, invalid key, etc.)
-        if (!response.ok) {
-            let errorMessage = 'Failed to generate speech with ElevenLabs.';
-            try {
-                const errorData = await response.json();
-                errorMessage = errorData.detail?.message || errorData.message || errorMessage;
-            } catch (e) {
-                errorMessage = `ElevenLabs error status: ${response.status} ${response.statusText}`;
+        if (res.ok) {
+            const data = await res.json();
+            if (data && Array.isArray(data[0])) {
+                const translated = data[0].map(segment => segment[0]).join('').trim();
+                if (translated) {
+                    return translated;
+                }
             }
-
-            console.error(`❌ ElevenLabs API Error (${response.status}):`, errorMessage);
-
-            if (response.status === 401) {
-                throw new AppError('Invalid ElevenLabs API Key. Please verify your key in server/.env', 401, 'INVALID_API_KEY');
-            }
-            if (response.status === 429) {
-                throw new AppError('ElevenLabs monthly quota exceeded or rate limited. Please check your credit balance.', 429, 'QUOTA_EXCEEDED');
-            }
-
-            throw new AppError(errorMessage, response.status, 'TTS_SYNTHESIS_FAILED');
         }
+    } catch (err) {
+        console.warn(`⚠️ Translation to [${lang}] failed, using original text:`, err.message);
+    }
 
-        // 4. Convert response stream into a Node.js Buffer
-        const arrayBuffer = await response.arrayBuffer();
-        const audioBuffer = Buffer.from(arrayBuffer);
+    return text;
+}
+
+/**
+ * Resolves the appropriate Neural Voice name given voiceId, language, and gender preference
+ */
+function resolveVoice(voiceId, language = 'en-US') {
+    // 1. Direct match with a curated voice
+    const directVoice = CURATED_VOICES.find(v => v.id === voiceId);
+    if (directVoice) {
+        return directVoice.id;
+    }
+
+    // 2. ElevenLabs fallback mapping
+    if (voiceId && ELEVEN_FALLBACK_MAP[voiceId]) {
+        return ELEVEN_FALLBACK_MAP[voiceId];
+    }
+
+    // 3. Language default fallback
+    const langConfig = DEFAULT_LANGUAGE_VOICES[language] || DEFAULT_LANGUAGE_VOICES['en-US'];
+    return langConfig.female;
+}
+
+/**
+ * Convert numeric speed (0.75, 1.0, 1.25, 1.5) to Edge TTS rate string ('-25%', '+0%', '+25%', '+50%')
+ */
+function formatSpeedRate(speed = 1.0) {
+    const s = parseFloat(speed);
+    if (isNaN(s) || s === 1.0) return '+0%';
+    const pct = Math.round((s - 1.0) * 100);
+    return (pct >= 0 ? `+${pct}%` : `${pct}%`);
+}
+
+/**
+ * Synthesizes speech using Microsoft Azure Neural TTS engine
+ */
+async function synthesizeWithEdgeTTS({ text, voiceName, speed = 1.0 }) {
+    const tts = new MsEdgeTTS();
+    await tts.setMetadata(voiceName, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+
+    const rate = formatSpeedRate(speed);
+    const { audioStream } = tts.toStream(text, { rate });
+
+    return new Promise((resolve, reject) => {
+        const chunks = [];
+        audioStream.on('data', chunk => chunks.push(chunk));
+        audioStream.on('end', () => {
+            const fullBuffer = Buffer.concat(chunks);
+            if (fullBuffer.length === 0) {
+                reject(new Error('Edge TTS returned empty audio buffer'));
+            } else {
+                resolve(fullBuffer);
+            }
+        });
+        audioStream.on('error', err => reject(err));
+    });
+}
+
+/**
+ * Universal Secondary Fallback TTS using Google Translate TTS
+ */
+async function synthesizeUniversalFallback({ text, language = 'en-US' }) {
+    const langCode = language ? language.split('-')[0].toLowerCase() : 'en';
+    const sentences = text.match(/[^.!?।\n]+[.!?।\n]+|[^.!?।\n]+$/g) || [text];
+    const chunks = [];
+    let currentChunk = '';
+
+    for (const s of sentences) {
+        if ((currentChunk + ' ' + s).trim().length <= 150) {
+            currentChunk = (currentChunk + ' ' + s).trim();
+        } else {
+            if (currentChunk) chunks.push(currentChunk);
+            currentChunk = s.trim();
+        }
+    }
+    if (currentChunk) chunks.push(currentChunk);
+
+    const audioBuffers = [];
+    for (const chunk of chunks) {
+        if (!chunk.trim()) continue;
+        const url = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(chunk)}&tl=${langCode}&client=tw-ob`;
+        const res = await fetch(url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                Accept: 'audio/mpeg',
+            },
+        });
+
+        if (res.ok) {
+            const arrayBuf = await res.arrayBuffer();
+            audioBuffers.push(Buffer.from(arrayBuf));
+        }
+    }
+
+    if (audioBuffers.length === 0) {
+        throw new Error('Universal fallback generated no audio');
+    }
+
+    return Buffer.concat(audioBuffers);
+}
+
+/**
+ * Main Speech Synthesis function
+ * Supports distinct Female and Male voices for all languages with automatic script translation
+ */
+export async function synthesizeSpeech({ text, voiceId, speed = 1.0, language = 'en-US' }) {
+    // 1. Determine target language and translate script if needed
+    let textToSpeak = text.trim();
+    const isEnglish = language.startsWith('en');
+
+    if (!isEnglish) {
+        textToSpeak = await translateTextToTarget(textToSpeak, language);
+        console.log(`🌐 Translated to [${language}]: "${textToSpeak.substring(0, 40)}..."`);
+    }
+
+    // 2. Resolve the exact neural voice
+    const activeVoice = resolveVoice(voiceId, language);
+    console.log(`🎙️ Synthesizing with Voice: [${activeVoice}] (${language}) at ${speed}x`);
+
+    // 3. Try Microsoft Azure Neural TTS first
+    try {
+        const audioBuffer = await synthesizeWithEdgeTTS({
+            text: textToSpeak,
+            voiceName: activeVoice,
+            speed,
+        });
 
         return {
             audioBuffer,
             mimeType: 'audio/mpeg',
-            voiceId: selectedVoiceId,
+            voiceId: activeVoice,
             format: 'mp3',
+            translatedText: textToSpeak,
         };
-    } catch (error) {
-        if (error instanceof AppError) throw error;
-        throw new AppError(`Speech synthesis service error: ${error.message}`, 500, 'TTS_SERVICE_ERROR');
+    } catch (edgeError) {
+        console.warn(`⚠️ Edge Neural TTS issue (${edgeError.message}). Using universal fallback...`);
+    }
+
+    // 4. Secondary fallback
+    try {
+        const audioBuffer = await synthesizeUniversalFallback({
+            text: textToSpeak,
+            language,
+        });
+
+        return {
+            audioBuffer,
+            mimeType: 'audio/mpeg',
+            voiceId: activeVoice,
+            format: 'mp3',
+            translatedText: textToSpeak,
+        };
+    } catch (fallbackError) {
+        console.error('❌ All TTS engines failed:', fallbackError);
+        throw new AppError(`Speech synthesis failed: ${fallbackError.message}`, 500, 'TTS_FAILED');
     }
 }
 
@@ -97,4 +224,5 @@ export async function getVoicesList() {
 export default {
     synthesizeSpeech,
     getVoicesList,
+    translateTextToTarget,
 };

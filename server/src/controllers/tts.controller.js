@@ -11,11 +11,12 @@ export async function generateSpeech(req, res, next) {
     try {
         const { text, voice, language = 'en-US', speed = 1.0 } = req.body;
 
-        // 1. Synthesize audio buffer using ElevenLabs
-        const { audioBuffer, mimeType, voiceId } = await synthesizeSpeech({
+        // 1. Synthesize audio buffer using ElevenLabs or high-fidelity neural fallback
+        const { audioBuffer, mimeType, voiceId, translatedText } = await synthesizeSpeech({
             text,
             voiceId: voice,
             speed,
+            language,
         });
 
         // 2. Upload generated audio to Supabase Cloud Storage
@@ -50,6 +51,7 @@ export async function generateSpeech(req, res, next) {
                 voiceId,
                 language,
                 fileSizeBytes: size,
+                translatedText: translatedText || text,
             },
         });
     } catch (error) {

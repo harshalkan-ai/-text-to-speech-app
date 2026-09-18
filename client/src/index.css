@@ -1,0 +1,12 @@
+@import './assets/styles/antigravity.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-[#060813] text-slate-100 antialiased;
+    font-family: 'Plus Jakarta Sans', sans-serif;
+  }
+}
